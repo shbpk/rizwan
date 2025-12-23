@@ -90,7 +90,7 @@ st.sidebar.header("1) Upload data")
 uploaded_file = st.sidebar.file_uploader("Upload your CSV file", type=["csv"])
 
 if uploaded_file is None:
-    st.info("Upload a CSV to begin. The dashboard will not load any built-in file.")
+    st.info("Upload CSV Please")
     st.stop()
 
 @st.cache_data
