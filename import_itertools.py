@@ -10,8 +10,8 @@ from statsmodels.stats.multicomp import pairwise_tukeyhsd
 
 
 st.set_page_config(page_title="N2O Explorer Dashboard", layout="wide")
-st.title("N₂O Dataset Explorer (Upload-only)")
-st.caption("Upload your CSV → explore by timeline, season, crop phase, planting, plot; run significance tests and correlations.")
+st.title("N2O Dataset Explorer")
+st.caption("Upload CSV → explore by time, season, crop phase, planting, plot num.")
 
 
 def add_season(dt_series: pd.Series) -> pd.Series:
