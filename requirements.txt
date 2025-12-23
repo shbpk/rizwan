@@ -1,0 +1,7 @@
+###Install these in your PC if you want to host locally, or if you wanna host online, this should be installed on the server. Streamlit just needs the list if you want to host there.
+###local PC run command >> python -m streamlit run budget_dashboard.py
+
+streamlit
+pandas
+numpy
+plotly
