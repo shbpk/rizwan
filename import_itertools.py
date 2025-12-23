@@ -1,348 +1,357 @@
-import itertools
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
 import plotly.express as px
 from scipy import stats
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
 
-# ----------------------------
-# Helpers
-# ----------------------------
+
+
+st.set_page_config(page_title="N2O Explorer Dashboard", layout="wide")
+st.title("N₂O Dataset Explorer (Upload-only)")
+st.caption("Upload your CSV → explore by timeline, season, crop phase, planting, plot; run significance tests and correlations.")
+
+
 def add_season(dt_series: pd.Series) -> pd.Series:
     """Meteorological seasons (DJF, MAM, JJA, SON)."""
     m = dt_series.dt.month
     return pd.Series(
         np.select(
-            [
-                m.isin([12, 1, 2]),
-                m.isin([3, 4, 5]),
-                m.isin([6, 7, 8]),
-                m.isin([9, 10, 11]),
-            ],
+            [m.isin([12, 1, 2]), m.isin([3, 4, 5]), m.isin([6, 7, 8]), m.isin([9, 10, 11])],
             ["Winter (DJF)", "Spring (MAM)", "Summer (JJA)", "Fall (SON)"],
             default="Unknown",
         ),
         index=dt_series.index,
     )
 
-def benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
-    """BH-FDR adjustment (returns q-values)."""
+def bh_fdr(pvals):
+    """Benjamini–Hochberg FDR adjusted p-values."""
     pvals = np.asarray(pvals, dtype=float)
     n = len(pvals)
     order = np.argsort(pvals)
     ranked = pvals[order]
-    q = ranked * n / (np.arange(1, n + 1))
-    q = np.minimum.accumulate(q[::-1])[::-1]
-    q = np.clip(q, 0, 1)
-    out = np.empty_like(q)
-    out[order] = q
+    adj_ranked = np.empty(n, dtype=float)
+
+    prev = 1.0
+    for i in range(n - 1, -1, -1):
+        rank = i + 1
+        val = ranked[i] * n / rank
+        prev = min(prev, val)
+        adj_ranked[i] = prev
+
+    out = np.empty(n, dtype=float)
+    out[order] = np.clip(adj_ranked, 0, 1)
     return out
 
-def safe_shapiro(x: np.ndarray):
-    """Shapiro-Wilk is sensitive; only run on 3..5000 samples."""
-    x = np.asarray(x, dtype=float)
-    x = x[~np.isnan(x)]
-    if len(x) < 3 or len(x) > 5000:
-        return np.nan, np.nan
-    try:
-        w, p = stats.shapiro(x)
-        return w, p
-    except Exception:
-        return np.nan, np.nan
-
-def group_test(df: pd.DataFrame, group_col: str, value_col: str = "n2og"):
-    """Returns omnibus test result + pairwise table (MWU + BH-FDR)."""
-    tmp = df[[group_col, value_col]].dropna()
-    tmp[group_col] = tmp[group_col].astype(str)
-
-    groups = [g for g, d in tmp.groupby(group_col) if len(d) >= 3]
-    if len(groups) < 2:
-        return None, None, "Not enough groups (need ≥2 groups with ≥3 points each)."
-
-    # Build group arrays
-    arrays = []
-    ns = []
-    for g in groups:
-        x = tmp.loc[tmp[group_col] == g, value_col].values.astype(float)
-        x = x[~np.isnan(x)]
-        arrays.append(x)
-        ns.append(len(x))
-
-    # Omnibus (default nonparametric)
-    if len(groups) == 2:
-        u, p = stats.mannwhitneyu(arrays[0], arrays[1], alternative="two-sided")
-        omnibus = {
-            "test": "Mann–Whitney U",
-            "groups": groups,
-            "statistic": float(u),
-            "p_value": float(p),
-        }
-        pairwise_df = None
-        return omnibus, pairwise_df, None
-
-    # >2 groups: Kruskal–Wallis
-    h, p = stats.kruskal(*arrays)
-    omnibus = {
-        "test": "Kruskal–Wallis H",
-        "groups": groups,
-        "statistic": float(h),
-        "p_value": float(p),
-    }
-
-    # Pairwise MWU + BH-FDR (post-hoc)
-    pairs = list(itertools.combinations(range(len(groups)), 2))
+def pairwise_mwu(df, group_col, value_col):
+    """Pairwise Mann–Whitney U with BH-FDR correction."""
+    groups = sorted([g for g in df[group_col].dropna().unique()])
     rows = []
-    pvals = []
-    for i, j in pairs:
-        gi, gj = groups[i], groups[j]
-        xi, xj = arrays[i], arrays[j]
-        u, pv = stats.mannwhitneyu(xi, xj, alternative="two-sided")
-        pvals.append(pv)
-        rows.append({"group_1": gi, "group_2": gj, "U": float(u), "p_raw": float(pv)})
 
-    qvals = benjamini_hochberg(np.array(pvals))
-    for r, qv in zip(rows, qvals):
-        r["p_FDR(BH)"] = float(qv)
+    for i in range(len(groups)):
+        for j in range(i + 1, len(groups)):
+            g1, g2 = groups[i], groups[j]
+            x = df.loc[df[group_col] == g1, value_col].dropna().values
+            y = df.loc[df[group_col] == g2, value_col].dropna().values
+            if len(x) < 2 or len(y) < 2:
+                continue
+            U, p = stats.mannwhitneyu(x, y, alternative="two-sided")  # Mann & Whitney, 1947
+            rows.append((g1, g2, U, p))
 
-    pairwise_df = pd.DataFrame(rows).sort_values("p_FDR(BH)")
-    return omnibus, pairwise_df, None
+    if not rows:
+        return pd.DataFrame(columns=["group1", "group2", "U", "p", "p_adj(BH)"])
+
+    out = pd.DataFrame(rows, columns=["group1", "group2", "U", "p"])
+    out["p_adj(BH)"] = bh_fdr(out["p"].values)  # Benjamini & Hochberg, 1995
+    return out.sort_values("p_adj(BH)")
+
+def effect_size_anova_eta_sq(anova_tbl):
+    """Eta-squared (η²) from ANOVA table (one-way)."""
+    ss_between = float(anova_tbl["sum_sq"].iloc[0])
+    ss_total = float(anova_tbl["sum_sq"].sum())
+    return ss_between / ss_total if ss_total > 0 else np.nan
+
+def effect_size_kruskal_epsilon_sq(H, n, k):
+    """Epsilon-squared (ε²) for Kruskal–Wallis."""
+    denom = (n - k)
+    if denom <= 0:
+        return np.nan
+    return (H - k + 1) / denom
+
+def require_columns(df, required):
+    missing = [c for c in required if c not in df.columns]
+    return missing
 
 
-# ----------------------------
-# App
-# ----------------------------
-st.set_page_config(page_title="N2OG Dashboard", layout="wide")
-st.title("N2OG Difference Dataset Explorer")
+st.sidebar.header("1) Upload data")
 
-st.caption(
-    "Explore N2OG by plot / season / crop phase / planting / cover crop, "
-    "filter by timeline, and run significance tests + correlation matrix."
+uploaded_file = st.sidebar.file_uploader("Upload your CSV file", type=["csv"])
+
+if uploaded_file is None:
+    st.info("Upload a CSV to begin. The dashboard will not load any built-in file.")
+    st.stop()
+
+@st.cache_data
+def load_data(file) -> pd.DataFrame:
+    return pd.read_csv(file)
+
+df = load_data(uploaded_file)
+
+st.sidebar.success("File loaded!")
+
+
+st.sidebar.header("2) Parse settings")
+
+all_cols = list(df.columns)
+
+date_col = st.sidebar.selectbox("Date column", options=all_cols, index=all_cols.index("date") if "date" in all_cols else 0)
+value_col = st.sidebar.selectbox("Value column (n2og)", options=all_cols, index=all_cols.index("n2og") if "n2og" in all_cols else 0)
+
+plot_col = st.sidebar.selectbox("Plot column", options=["(none)"] + all_cols, index=(["(none)"] + all_cols).index("plot") if "plot" in all_cols else 0)
+rep_col = st.sidebar.selectbox("Rep column", options=["(none)"] + all_cols, index=(["(none)"] + all_cols).index("rep") if "rep" in all_cols else 0)
+crop_phase_col = st.sidebar.selectbox("Crop phase column", options=["(none)"] + all_cols, index=(["(none)"] + all_cols).index("crop phase") if "crop phase" in all_cols else 0)
+planting_col = st.sidebar.selectbox("Planting column", options=["(none)"] + all_cols, index=(["(none)"] + all_cols).index("planting") if "planting" in all_cols else 0)
+cc_col = st.sidebar.selectbox("CC column", options=["(none)"] + all_cols, index=(["(none)"] + all_cols).index("cc") if "cc" in all_cols else 0)
+doy_col = st.sidebar.selectbox("DOY column", options=["(none)"] + all_cols, index=(["(none)"] + all_cols).index("doy") if "doy" in all_cols else 0)
+
+w = df.copy()
+
+w["__date__"] = pd.to_datetime(w[date_col], errors="coerce")
+w["__value__"] = pd.to_numeric(w[value_col], errors="coerce")
+
+if plot_col != "(none)":
+    w["__plot__"] = pd.to_numeric(w[plot_col], errors="coerce")
+if rep_col != "(none)":
+    w["__rep__"] = pd.to_numeric(w[rep_col], errors="coerce")
+if doy_col != "(none)":
+    w["__doy__"] = pd.to_numeric(w[doy_col], errors="coerce")
+
+def as_cat(src, target):
+    if src != "(none)" and src in w.columns:
+        w[target] = w[src].astype(str).str.strip()
+as_cat(crop_phase_col, "__crop_phase__")
+as_cat(planting_col, "__planting__")
+as_cat(cc_col, "__cc__")
+
+w = w.dropna(subset=["__date__", "__value__"])
+w["__season__"] = add_season(w["__date__"])
+w["__year__"] = w["__date__"].dt.year.astype("Int64")
+w["__month__"] = w["__date__"].dt.month.astype("Int64")
+
+
+st.sidebar.header("3) Filters")
+
+min_date = w["__date__"].min()
+max_date = w["__date__"].max()
+
+date_range = st.sidebar.slider(
+    "Date range",
+    min_value=min_date.to_pydatetime(),
+    max_value=max_date.to_pydatetime(),
+    value=(min_date.to_pydatetime(), max_date.to_pydatetime()),
 )
 
-# Data input
-with st.sidebar:
-    st.header("Data")
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
-    default_path = "Data for Dashboard Rizwan.csv"
-    use_default = st.checkbox("Use default file in app folder", value=(uploaded is None))
+f = w[(w["__date__"] >= pd.to_datetime(date_range[0])) & (w["__date__"] <= pd.to_datetime(date_range[1]))].copy()
 
-@st.cache_data(show_spinner=False)
-def load_data_from_filelike(filelike):
-    return pd.read_csv(filelike)
+def multi_filter(df_in, col, label):
+    if col not in df_in.columns:
+        return df_in
+    opts = sorted(df_in[col].dropna().unique())
+    if len(opts) == 0:
+        return df_in
+    sel = st.sidebar.multiselect(label, opts, default=opts)
+    return df_in[df_in[col].isin(sel)]
 
-@st.cache_data(show_spinner=False)
-def load_data_from_path(path):
-    return pd.read_csv(path)
+f = multi_filter(f, "__season__", "Season")
+f = multi_filter(f, "__crop_phase__", "Crop phase")
+f = multi_filter(f, "__planting__", "Planting")
+f = multi_filter(f, "__cc__", "Cover crop (cc)")
+if "__plot__" in f.columns:
+    plot_opts = sorted(f["__plot__"].dropna().unique())
+    sel_plot = st.sidebar.multiselect("Plot", plot_opts, default=plot_opts[: min(30, len(plot_opts))])
+    f = f[f["__plot__"].isin(sel_plot)]
+if "__rep__" in f.columns:
+    rep_opts = sorted(f["__rep__"].dropna().unique())
+    sel_rep = st.sidebar.multiselect("Rep", rep_opts, default=rep_opts)
+    f = f[f["__rep__"].isin(sel_rep)]
 
-if uploaded is not None:
-    df = load_data_from_filelike(uploaded)
-elif use_default:
-    try:
-        df = load_data_from_path(default_path)
-    except Exception as e:
-        st.error(
-            f"Couldn't load '{default_path}'. Put the CSV next to app.py or upload it. Error: {e}"
-        )
-        st.stop()
-else:
-    st.info("Upload a CSV or enable 'Use default file in app folder'.")
-    st.stop()
 
-# Standardize + derived fields
-df = df.copy()
-df.columns = [c.strip() for c in df.columns]
-if "date" not in df.columns:
-    st.error("Expected a 'date' column in the CSV.")
-    st.stop()
-
-df["date"] = pd.to_datetime(df["date"], errors="coerce")
-df = df.dropna(subset=["date"])
-
-df["year"] = df["date"].dt.year
-df["month"] = df["date"].dt.month
-df["season"] = add_season(df["date"])
-
-# Make sure expected categorical columns exist
-expected_cats = ["plot", "crop phase", "planting", "cc", "rep"]
-for c in expected_cats:
-    if c in df.columns:
-        df[c] = df[c].astype(str)
-
-# Sidebar filters
-with st.sidebar:
-    st.header("Filters")
-
-    min_d, max_d = df["date"].min(), df["date"].max()
-    date_range = st.slider(
-        "Timeline",
-        min_value=min_d.to_pydatetime(),
-        max_value=max_d.to_pydatetime(),
-        value=(min_d.to_pydatetime(), max_d.to_pydatetime()),
-    )
-
-    def multisel(col, label):
-        if col not in df.columns:
-            return None
-        opts = sorted(df[col].dropna().astype(str).unique().tolist())
-        return st.multiselect(label, options=opts, default=opts)
-
-    sel_plot = multisel("plot", "Plot")
-    sel_crop_phase = multisel("crop phase", "Crop phase")
-    sel_planting = multisel("planting", "Planting")
-    sel_cc = multisel("cc", "Cover crop (cc)")
-    sel_season = st.multiselect(
-        "Season", options=sorted(df["season"].unique().tolist()),
-        default=sorted(df["season"].unique().tolist())
-    )
-
-    y_scale = st.selectbox("Y scale", ["linear", "log"], index=0)
-    show_points = st.checkbox("Show individual points on boxplots", value=True)
-
-# Apply filters
-mask = (df["date"] >= pd.to_datetime(date_range[0])) & (df["date"] <= pd.to_datetime(date_range[1]))
-if sel_plot is not None:
-    mask &= df["plot"].isin(sel_plot)
-if sel_crop_phase is not None:
-    mask &= df["crop phase"].isin(sel_crop_phase)
-if sel_planting is not None:
-    mask &= df["planting"].isin(sel_planting)
-if sel_cc is not None:
-    mask &= df["cc"].isin(sel_cc)
-mask &= df["season"].isin(sel_season)
-
-dff = df.loc[mask].copy()
-
-# Summary metrics
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Rows", f"{len(dff):,}")
-c2.metric("Date min", str(dff["date"].min().date()) if len(dff) else "—")
-c3.metric("Date max", str(dff["date"].max().date()) if len(dff) else "—")
-c4.metric("N2OG mean", f"{dff['n2og'].mean():.3f}" if ("n2og" in dff.columns and len(dff)) else "—")
+c1.metric("Rows (filtered)", f"{len(f):,}")
+c2.metric("Mean", f"{f['__value__'].mean():.4g}")
+c3.metric("Median", f"{f['__value__'].median():.4g}")
+c4.metric("Std dev", f"{f['__value__'].std():.4g}")
 
-if len(dff) == 0:
-    st.warning("No data after filtering. Widen the filters.")
-    st.stop()
+tabs = st.tabs(["Plots", "Season & Phase", "Significance Tests", "Correlation", "Data"])
 
-# ----------------------------
-# Tabs
-# ----------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["Plots", "Season / Phase Views", "Stats Tests", "Correlation"])
 
-# ---- Tab 1: Plots
-with tab1:
-    st.subheader("Timeline views")
+with tabs[0]:
+    st.subheader("Time series and distributions")
 
-    # Daily mean line (if multiple points per day)
-    daily = dff.groupby("date", as_index=False)["n2og"].agg(["mean", "median", "count"]).reset_index()
-    fig = px.line(daily, x="date", y="mean", markers=True, title="Daily mean N2OG")
-    fig.update_yaxes(type=y_scale)
+    daily = f.groupby("__date__", as_index=False)["__value__"].agg(["mean", "median", "count"]).reset_index()
+    fig_ts = px.line(daily, x="__date__", y="mean", title="Daily mean (filtered)")
+    st.plotly_chart(fig_ts, use_container_width=True)
+
+    candidates = []
+    if "__plot__" in f.columns: candidates.append("__plot__")
+    candidates += ["__season__"]
+    if "__crop_phase__" in f.columns: candidates.append("__crop_phase__")
+    if "__planting__" in f.columns: candidates.append("__planting__")
+    if "__cc__" in f.columns: candidates.append("__cc__")
+    if "__rep__" in f.columns: candidates.append("__rep__")
+
+    group_col = st.selectbox("Group distributions by", options=candidates, index=0)
+
+    chart_type = st.radio("Distribution chart", options=["Box", "Violin"], horizontal=True)
+
+    if chart_type == "Box":
+        fig = px.box(f, x=group_col, y="__value__", points="outliers", title=f"Value by {group_col}")
+    else:
+        fig = px.violin(f, x=group_col, y="__value__", box=True, points="outliers", title=f"Value by {group_col}")
+
+    fig.update_layout(xaxis_title=group_col, yaxis_title=value_col)
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Scatter: N2OG vs DOY")
-    if "doy" in dff.columns:
-        fig2 = px.scatter(
-            dff, x="doy", y="n2og",
-            color="season", symbol="planting" if "planting" in dff.columns else None,
-            hover_data=["plot", "crop phase", "cc", "rep"] if all(c in dff.columns for c in ["plot","crop phase","cc","rep"]) else None,
-            title="N2OG vs Day-of-Year (colored by season)"
-        )
-        fig2.update_yaxes(type=y_scale)
-        st.plotly_chart(fig2, use_container_width=True)
+
+with tabs[1]:
+    st.subheader("Faceted views")
+
+    facet_row_opts = ["__season__"]
+    if "__crop_phase__" in f.columns: facet_row_opts.append("__crop_phase__")
+    if "__planting__" in f.columns: facet_row_opts.append("__planting__")
+    if "__cc__" in f.columns: facet_row_opts.append("__cc__")
+
+    facet_col_opts = []
+    if "__crop_phase__" in f.columns: facet_col_opts.append("__crop_phase__")
+    if "__planting__" in f.columns: facet_col_opts.append("__planting__")
+    if "__cc__" in f.columns: facet_col_opts.append("__cc__")
+    if "__rep__" in f.columns: facet_col_opts.append("__rep__")
+
+    facet_row = st.selectbox("Facet row", options=facet_row_opts, index=0)
+    facet_col = st.selectbox("Facet color", options=facet_col_opts if facet_col_opts else ["__season__"], index=0)
+
+    agg = f.groupby(["__date__", facet_row, facet_col], as_index=False)["__value__"].mean().rename(columns={"__value__": "mean_value"})
+    fig_fac = px.line(
+        agg,
+        x="__date__",
+        y="mean_value",
+        color=facet_col,
+        facet_row=facet_row,
+        title="Mean value over time (faceted)",
+    )
+    st.plotly_chart(fig_fac, use_container_width=True)
+
+    st.markdown("**Season summary**")
+    seas_sum = f.groupby("__season__")["__value__"].agg(["count", "mean", "median", "std"]).reset_index()
+    st.dataframe(seas_sum, use_container_width=True)
+
+
+with tabs[2]:
+    st.subheader("Significance tests for group differences")
+
+    test_factors = ["__season__"]
+    if "__crop_phase__" in f.columns: test_factors.append("__crop_phase__")
+    if "__planting__" in f.columns: test_factors.append("__planting__")
+    if "__cc__" in f.columns: test_factors.append("__cc__")
+    if "__plot__" in f.columns: test_factors.append("__plot__")
+    if "__rep__" in f.columns: test_factors.append("__rep__")
+
+    factor = st.selectbox("Factor to test", options=test_factors, index=0)
+
+    test_mode = st.radio(
+        "Test selection",
+        options=["Auto (ANOVA if ~normal; else Kruskal)", "Force ANOVA", "Force Kruskal-Wallis"],
+        horizontal=True,
+    )
+
+    tdf = f[[factor, "__value__"]].dropna()
+
+    # Keep only groups with n>=5 for stability
+    counts = tdf.groupby(factor)["__value__"].size()
+    keep = counts[counts >= 5].index
+    tdf = tdf[tdf[factor].isin(keep)]
+
+    st.caption("Only groups with n≥5 are included (reduces unstable inference).")
+
+    if tdf[factor].nunique() < 2:
+        st.warning("Not enough groups after filtering to run a test.")
     else:
-        st.info("No 'doy' column found for DOY scatter.")
+        vals = tdf["__value__"].values
+        vals_shap = np.random.choice(vals, size=5000, replace=False) if len(vals) > 5000 else vals
 
-# ---- Tab 2: Season / Phase Views
-with tab2:
-    st.subheader("Distributions by key groupings")
+        shapiro_p = np.nan
+        try:
+            shapiro_p = stats.shapiro(vals_shap).pvalue  # Shapiro & Wilk, 1965
+        except Exception:
+            pass
 
-    group_col = st.selectbox(
-        "Choose grouping for boxplot",
-        options=[c for c in ["plot", "season", "crop phase", "planting", "cc", "rep"] if c in dff.columns],
-        index=0
-    )
+        st.write(f"Shapiro–Wilk p-value (pooled, approximate): **{shapiro_p:.4g}**")
 
-    figb = px.box(
-        dff, x=group_col, y="n2og",
-        points="all" if show_points else False,
-        title=f"N2OG distribution by {group_col}"
-    )
-    figb.update_yaxes(type=y_scale)
-    st.plotly_chart(figb, use_container_width=True)
+        if test_mode.startswith("Auto"):
+            chosen = "anova" if (not np.isnan(shapiro_p) and shapiro_p >= 0.05) else "kruskal"
+        elif test_mode.startswith("Force ANOVA"):
+            chosen = "anova"
+        else:
+            chosen = "kruskal"
 
-    st.subheader("Faceted view (optional)")
-    facet = st.selectbox(
-        "Facet by (optional)",
-        options=["None"] + [c for c in ["season", "crop phase", "planting", "cc"] if c in dff.columns],
-        index=0
-    )
-    if facet != "None":
-        figf = px.box(
-            dff, x=group_col, y="n2og",
-            points=False,
-            facet_col=facet,
-            title=f"N2OG by {group_col} (faceted by {facet})"
-        )
-        figf.update_yaxes(type=y_scale)
-        st.plotly_chart(figf, use_container_width=True)
+        st.write(f"Chosen test: **{ 'One-way ANOVA' if chosen=='anova' else 'Kruskal–Wallis' }**")
 
-# ---- Tab 3: Stats Tests
-with tab3:
-    st.subheader("Significance testing (group differences)")
+        if chosen == "anova":
+            tmp = tdf.rename(columns={factor: "factor", "__value__": "value"})
+            model = ols("value ~ C(factor)", data=tmp).fit()  # Fisher, 1925 framework
+            anova_tbl = sm.stats.anova_lm(model, typ=2)
 
-    test_group = st.selectbox(
-        "Test differences across:",
-        options=[c for c in ["plot", "season", "crop phase", "planting", "cc", "rep"] if c in dff.columns],
-        index=0
-    )
+            pval = float(anova_tbl["PR(>F)"].iloc[0])
+            eta2 = effect_size_anova_eta_sq(anova_tbl)
 
-    st.write("Normality check (Shapiro–Wilk) is shown for context; the app uses nonparametric tests by default.")
+            st.markdown(f"**ANOVA p-value:** `{pval:.4g}`")
+            st.markdown(f"**Effect size (η²):** `{eta2:.4f}`")
+            st.dataframe(anova_tbl.reset_index(), use_container_width=True)
 
-    # Shapiro per group
-    sh_rows = []
-    for g, dd in dff.groupby(test_group):
-        w, p = safe_shapiro(dd["n2og"].values)
-        sh_rows.append({"group": str(g), "n": int(dd["n2og"].notna().sum()), "W": w, "p": p})
-    sh_df = pd.DataFrame(sh_rows).sort_values("p")
-    st.dataframe(sh_df, use_container_width=True)
+            st.markdown("**Posthoc: Tukey HSD (pairwise)**")
+            try:
+                tuk = pairwise_tukeyhsd(endog=tmp["value"], groups=tmp["factor"], alpha=0.05)
+                tuk_df = pd.DataFrame(tuk.summary().data[1:], columns=tuk.summary().data[0])
+                st.dataframe(tuk_df, use_container_width=True)
+            except Exception as e:
+                st.warning(f"Could not run Tukey HSD: {e}")
 
-    omnibus, pairwise, err = group_test(dff, test_group, "n2og")
-    if err:
-        st.warning(err)
+        else:
+            grouped = [g["__value__"].values for _, g in tdf.groupby(factor)]
+            H, pval = stats.kruskal(*grouped)  # Kruskal & Wallis, 1952
+            n = len(tdf)
+            k = tdf[factor].nunique()
+            eps2 = effect_size_kruskal_epsilon_sq(H, n, k)
+
+            st.markdown(f"**Kruskal–Wallis H:** `{H:.4f}`")
+            st.markdown(f"**Kruskal p-value:** `{pval:.4g}`")
+            st.markdown(f"**Effect size (ε²):** `{eps2:.4f}`")
+
+            st.markdown("**Posthoc: pairwise Mann–Whitney U + BH-FDR**")
+            post = pairwise_mwu(tdf.rename(columns={factor: "factor"}), "factor", "__value__")
+            st.dataframe(post, use_container_width=True)
+
+
+with tabs[3]:
+    st.subheader("Correlation matrix")
+
+    method = st.radio("Correlation method", options=["Pearson", "Spearman"], horizontal=True)  # Pearson 1895; Spearman 1904
+
+    numeric_cols = [c for c in f.columns if pd.api.types.is_numeric_dtype(f[c])]
+    # Remove derived IDs if you want (still available)
+    default_cols = [c for c in numeric_cols if c not in ["__plot__", "__rep__"]]
+    sel_num = st.multiselect("Numeric columns", numeric_cols, default=default_cols)
+
+    if len(sel_num) < 2:
+        st.warning("Select at least 2 numeric columns.")
     else:
-        st.markdown("### Omnibus test")
-        st.json(omnibus)
+        corr = f[sel_num].corr(method="pearson" if method == "Pearson" else "spearman")
+        fig_corr = px.imshow(corr, text_auto=True, title=f"{method} correlation matrix")
+        st.plotly_chart(fig_corr, use_container_width=True)
+        st.dataframe(corr, use_container_width=True)
 
-        if pairwise is not None:
-            st.markdown("### Post-hoc (pairwise Mann–Whitney U with BH-FDR)")
-            st.dataframe(pairwise, use_container_width=True)
-
-            sig = pairwise[pairwise["p_FDR(BH)"] <= 0.05].copy()
-            st.markdown("### Significant pairs (q ≤ 0.05)")
-            st.dataframe(sig if len(sig) else pd.DataFrame({"note": ["None at q≤0.05"]}), use_container_width=True)
-
-# ---- Tab 4: Correlation
-with tab4:
-    st.subheader("Correlation matrix (Spearman)")
-    numeric_cols = []
-    for c in dff.columns:
-        if pd.api.types.is_numeric_dtype(dff[c]):
-            numeric_cols.append(c)
-
-    # Also attempt to coerce a few known numeric-like IDs
-    for c in ["plot", "rep", "doy"]:
-        if c in dff.columns and c not in numeric_cols:
-            coerced = pd.to_numeric(dff[c], errors="coerce")
-            if coerced.notna().sum() > 0:
-                dff[f"{c}__num"] = coerced
-                numeric_cols.append(f"{c}__num")
-
-    numeric_cols = [c for c in numeric_cols if c != "month" and c != "year"] + [c for c in ["month","year"] if c in dff.columns and pd.api.types.is_numeric_dtype(dff[c])]
-
-    if len(numeric_cols) < 2:
-        st.info("Not enough numeric columns for a correlation matrix.")
-    else:
-        corr = dff[numeric_cols].corr(method="spearman")
-        figc = px.imshow(corr, text_auto=True, title="Spearman correlation matrix")
-        st.plotly_chart(figc, use_container_width=True)
-
-st.caption("Tip: Use filters to isolate specific plots/seasons/phases before running the stats tab.")
+with tabs[4]:
+    st.subheader("Filtered data preview")
+    st.dataframe(f.sort_values("__date__"), use_container_width=True)
